@@ -1,4 +1,4 @@
-module github.com/ymtdzzz/otel-tui/tuiexporter
+module github.com/BIwashi/otel-tui/tuiexporter
 
 go 1.22.7
 
@@ -8,6 +8,7 @@ require (
 	github.com/navidys/tvxwidgets v0.9.0
 	github.com/rivo/tview v0.0.0-20240616192244-23476fa0bab2
 	github.com/stretchr/testify v1.10.0
+	github.com/ymtdzzz/otel-tui/tuiexporter v0.0.0-20241125015642-228b60606412
 	go.opentelemetry.io/collector/component v0.114.0
 	go.opentelemetry.io/collector/component/componentstatus v0.114.0
 	go.opentelemetry.io/collector/component/componenttest v0.114.0
