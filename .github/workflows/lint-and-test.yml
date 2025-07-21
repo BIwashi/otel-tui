@@ -1,6 +1,10 @@
-name:  lint-and-test
+name: lint-and-test
 
-on: push
+on:
+  push:
+    branches:
+      - main
+  pull_request:
 
 jobs:
   lint:
@@ -8,10 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt update && sudo apt install -y libx11-dev
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version-file: './go.mod'
+          go-version-file: "./go.mod"
       - name: Run lint
         run: make install-lint-tools lint
   lint-exporter:
@@ -19,10 +25,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt update && sudo apt install -y libx11-dev
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version-file: './go.mod'
+          go-version-file: "./go.mod"
       - name: Run lint for exporter
         run: make install-lint-tools lint-exporter
 
@@ -31,10 +39,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt update && sudo apt install -y libx11-dev
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version-file: './go.mod'
+          go-version-file: "./go.mod"
       - name: Run test
         run: make test
   test-exporter:
@@ -42,9 +52,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt update && sudo apt install -y libx11-dev
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version-file: './go.mod'
+          go-version-file: "./go.mod"
       - name: Run test for exporter
         run: make test-exporter

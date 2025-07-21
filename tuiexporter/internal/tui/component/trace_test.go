@@ -3,12 +3,14 @@ package component
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 	"github.com/stretchr/testify/assert"
+	"github.com/ymtdzzz/otel-tui/tuiexporter/internal/datetime"
 	"github.com/ymtdzzz/otel-tui/tuiexporter/internal/telemetry"
 	"github.com/ymtdzzz/otel-tui/tuiexporter/internal/test"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -183,7 +185,7 @@ func TestSpanDataForTable(t *testing.T) {
 				name:   "received at trace 2 span-1-1-1",
 				row:    2,
 				column: 3,
-				want:   receivedAt.Local().Format("2006-01-02 15:04:05"),
+				want:   datetime.GetSimpleTime(receivedAt.Local()),
 			},
 			{
 				name:   "span name trace 2 span-1-1-1",
@@ -198,10 +200,16 @@ func TestSpanDataForTable(t *testing.T) {
 				assert.Equal(t, tt.want, sdftable.GetCell(tt.row+1, tt.column).Text)
 			})
 		}
+
+		t.Run("full datetime", func(t *testing.T) {
+			sdftable.SetFullDatetime(true)
+			defer sdftable.SetFullDatetime(false)
+			assert.Equal(t, datetime.GetFullTime(receivedAt.Local()), sdftable.GetCell(3, 3).Text)
+		})
 	})
 }
 
-func TestGetTraceInfoTree(t *testing.T) {
+func TestGetTraceInfoTreeWithServiceName(t *testing.T) {
 	// traceid: 1
 	//  └- resource: test-service-1
 	//  | └- scope: test-scope-1-1
@@ -234,7 +242,7 @@ func TestGetTraceInfoTree(t *testing.T) {
 		ResourceSpan: testdata.RSpans[1],
 		ScopeSpans:   testdata.SSpans[2],
 	})
-	sw, sh := 55, 20
+	sw, sh := 55, 23
 	screen := tcell.NewSimulationScreen("")
 	screen.Init()
 	screen.SetSize(sw, sh)
@@ -258,28 +266,129 @@ func TestGetTraceInfoTree(t *testing.T) {
 		}
 	}
 
-	want := `test-service-1 (01000000000000000000000000000000)      
-├──Statistics                                          
-│  └──span count: 4                                    
-└──Resource                                            
-   ├──dropped attributes count: 1                      
-   ├──schema url:                                      
-   ├──Attributes                                       
-   │  ├──resource attribute: resource attribute value  
-   │  ├──resource index: 0                             
-   │  └──service.name: test-service-1                  
-   └──Scopes                                           
-      ├──test-scope-1-1                                
-      │  ├──schema url:                                
-      │  ├──version: v0.0.1                            
-      │  ├──dropped attributes count: 2                
-      │  └──Attributes                                 
-      │     └──scope index: 0                          
-      └──test-scope-1-2                                
-         ├──schema url:                                
-         └──version: v0.0.1                            
+	want := `test-service-1 (01000000000000000000000000000000)
+├──Statistics
+│  └──span count: 4
+└──Resource
+   ├──dropped attributes count: 1
+   ├──schema url:
+   ├──Attributes
+   │  ├──resource attribute: resource attribute value
+   │  ├──resource index: 0
+   │  └──service.name: test-service-1
+   └──Scopes
+      ├──test-scope-1-1
+      │  ├──schema url:
+      │  ├──version: v0.0.1
+      │  ├──dropped attributes count: 2
+      │  └──Attributes
+      │     └──scope index: 0
+      └──test-scope-1-2
+         ├──schema url:
+         ├──version: v0.0.1
+         ├──dropped attributes count: 2
+         └──Attributes
+            └──scope index: 1
 `
-	assert.Equal(t, want, got.String())
+	gotLines := strings.Split(got.String(), "\n")
+	wantLines := strings.Split(want, "\n")
+
+	assert.Equal(t, len(wantLines), len(gotLines))
+
+	for i := 0; i < len(wantLines); i++ {
+		assert.Equal(t, strings.TrimRight(wantLines[i], " \t\r"), strings.TrimRight(gotLines[i], " \t\r"))
+	}
+}
+
+func TestGetTraceInfoTreeWithoutServiceName(t *testing.T) {
+	// traceid: 1
+	//  └- resource: [Empty]
+	//  | └- scope: test-scope-1-1
+	//  | | └- span: span-1-1-1
+	//  | | └- span: span-1-1-2
+	//  | └- scope: test-scope-1-2
+	//  |   └- span: span-1-2-3
+	//  └- resource: test-service-2
+	//    └- scope: test-scope-2-1
+	//      └- span: span-2-1-1
+	_, testdata := test.GenerateOTLPTracesPayload(t, 1, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
+	testdata.RSpans[0].Resource().Attributes().Remove("service.name")
+	spans := []*telemetry.SpanData{}
+	spans = append(spans, &telemetry.SpanData{
+		Span:         testdata.Spans[0],
+		ResourceSpan: testdata.RSpans[0],
+		ScopeSpans:   testdata.SSpans[0],
+	})
+	spans = append(spans, &telemetry.SpanData{
+		Span:         testdata.Spans[1],
+		ResourceSpan: testdata.RSpans[0],
+		ScopeSpans:   testdata.SSpans[0],
+	})
+	spans = append(spans, &telemetry.SpanData{
+		Span:         testdata.Spans[2],
+		ResourceSpan: testdata.RSpans[0],
+		ScopeSpans:   testdata.SSpans[1],
+	})
+	spans = append(spans, &telemetry.SpanData{
+		Span:         testdata.Spans[3],
+		ResourceSpan: testdata.RSpans[1],
+		ScopeSpans:   testdata.SSpans[2],
+	})
+	sw, sh := 55, 22
+	screen := tcell.NewSimulationScreen("")
+	screen.Init()
+	screen.SetSize(sw, sh)
+
+	gottree := getTraceInfoTree(nil, noopShowModalFn, noopHideModalFn, spans)
+	gottree.SetRect(0, 0, sw, sh)
+	gottree.Draw(screen)
+	screen.Sync()
+
+	contents, w, _ := screen.GetContents()
+	var got bytes.Buffer
+	for n, v := range contents {
+		var err error
+		if n%w == w-1 {
+			_, err = fmt.Fprintf(&got, "%c\n", v.Runes[0])
+		} else {
+			_, err = fmt.Fprintf(&got, "%c", v.Runes[0])
+		}
+		if err != nil {
+			t.Error(err)
+		}
+	}
+
+	want := `unknown (01000000000000000000000000000000)
+├──Statistics
+│  └──span count: 4
+└──Resource
+   ├──dropped attributes count: 1
+   ├──schema url:
+   ├──Attributes
+   │  ├──resource attribute: resource attribute value
+   │  └──resource index: 0
+   └──Scopes
+      ├──test-scope-1-1
+      │  ├──schema url:
+      │  ├──version: v0.0.1
+      │  ├──dropped attributes count: 2
+      │  └──Attributes
+      │     └──scope index: 0
+      └──test-scope-1-2
+         ├──schema url:
+         ├──version: v0.0.1
+         ├──dropped attributes count: 2
+         └──Attributes
+            └──scope index: 1
+`
+	gotLines := strings.Split(got.String(), "\n")
+	wantLines := strings.Split(want, "\n")
+
+	assert.Equal(t, len(wantLines), len(gotLines))
+
+	for i := 0; i < len(wantLines); i++ {
+		assert.Equal(t, strings.TrimRight(wantLines[i], " \t\r"), strings.TrimRight(gotLines[i], " \t\r"))
+	}
 }
 
 func TestGetTraceInfoTreeNoSpans(t *testing.T) {

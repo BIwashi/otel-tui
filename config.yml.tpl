@@ -4,22 +4,41 @@ receivers:
     protocols:
       http:
         endpoint: {{ .OTLPHost }}:{{ .OTLPHTTPPort }}
+        cors:
+          allowed_origins:
+            - http://localhost:*
+            - https://localhost:*
       grpc:
         endpoint: {{ .OTLPHost }}:{{ .OTLPGRPCPort }}
 {{- if .EnableZipkin}}
   zipkin:
     endpoint: 0.0.0.0:9411
 {{- end}}
-{{- if .EnableProm}}
+{{- if gt (len .PromScrapeConfigs) 0}}
   prometheus:
     config:
       scrape_configs:
-        - job_name: 'prometheus'
-          scrape_interval: 15s
+{{- range $_, $config := .PromScrapeConfigs}}
+        - job_name: '{{ $config.JobName -}}'
+          scrape_interval: 5s
+{{- if ne $config.MetricsPath ""}}
+          metrics_path: '{{ $config.MetricsPath -}}'
+{{- end}}
+{{- if ne $config.Scheme ""}}
+          scheme: '{{ $config.Scheme -}}'
+{{- end}}
+{{- if $config.Params }}
+          params:
+{{- range $param := $config.Params }}
+            {{ $param.Key }}:
+{{- range $v := $param.Values }}
+              - '{{ $v }}'
+{{- end }}
+{{- end }}
+{{- end }}
           static_configs:
             - targets:
-{{- range $idx, $target := .PromTarget}}
-              - '{{ $target -}}'
+              - '{{ $config.Target -}}'
 {{- end}}
 {{- end}}
 {{- if gt (len .FromJSONFile) 0}}
@@ -31,10 +50,12 @@ receivers:
 processors:
 exporters:
   tui:
+    from_json_file: {{ if .FromJSONFile }}true{{else}}false{{end}}
+    debug_log_file_path: '{{ .DebugLogFilePath }}'
 service:
   pipelines:
     traces:
-      receivers: 
+      receivers:
         - otlp
 {{- if .EnableZipkin}}
         - zipkin
@@ -57,7 +78,7 @@ service:
     metrics:
       receivers:
         - otlp
-{{- if .EnableProm}}
+{{- if gt (len .PromScrapeConfigs) 0}}
         - prometheus
 {{- end}}
 {{- if gt (len .FromJSONFile) 0}}

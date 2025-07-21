@@ -7,36 +7,42 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"github.com/ymtdzzz/otel-tui/tuiexporter/internal/json"
 	"github.com/ymtdzzz/otel-tui/tuiexporter/internal/telemetry"
 	"golang.design/x/clipboard"
 )
 
 const (
-	PAGE_TRACES    = "Traces"
-	PAGE_TIMELINE  = "Timeline"
-	PAGE_LOGS      = "Logs"
-	PAGE_DEBUG_LOG = "DebugLog"
-	PAGE_METRICS   = "Metrics"
-	PAGE_MODAL     = "Modal"
+	PAGE_TRACES         = "Traces"
+	PAGE_TIMELINE       = "Timeline"
+	PAGE_TRACE_TOPOLOGY = "TraceTopology"
+	PAGE_LOGS           = "Logs"
+	PAGE_METRICS        = "Metrics"
+	PAGE_MODAL          = "Modal"
 
-	DEFAULT_PROPORTION_TRACE_DETAILS = 20
-	DEFAULT_PROPORTION_TRACE_TABLE   = 30
-	DEFAULT_PROPORTION_METRIC_SIDE   = 25
-	DEFAULT_PROPORTION_METRIC_TABLE  = 25
-	DEFAULT_PROPORTION_LOG_DETAILS   = 20
-	DEFAULT_PROPORTION_LOG_TABLE     = 30
+	DEFAULT_HORIZONTAL_PROPORTION_TRACE_DETAILS = 20
+	DEFAULT_HORIZONTAL_PROPORTION_TRACE_TABLE   = 30
+	DEFAULT_HORIZONTAL_PROPORTION_METRIC_SIDE   = 25
+	DEFAULT_HORIZONTAL_PROPORTION_METRIC_TABLE  = 25
+	DEFAULT_HORIZONTAL_PROPORTION_LOG_DETAILS   = 20
+	DEFAULT_HORIZONTAL_PROPORTION_LOG_TABLE     = 30
+	DEFAULT_VERTICAL_PROPORTION_LOG_MAIN        = 15
+	DEFAULT_VERTICAL_PROPORTION_LOG_BODY        = 3
 )
 
 type TUIPages struct {
-	pages      *tview.Pages
-	traces     *tview.Flex
-	timeline   *tview.Flex
-	metrics    *tview.Flex
-	logs       *tview.Flex
-	debuglog   *tview.Flex
-	modal      *tview.Flex
-	current    string
-	setFocusFn func(p tview.Primitive)
+	store             *telemetry.Store
+	pages             *tview.Pages
+	traces            *tview.Flex
+	timeline          *tview.Flex
+	topology          *tview.Flex
+	metrics           *tview.Flex
+	logs              *tview.Flex
+	modal             *tview.Flex
+	clearFns          []func()
+	current           string
+	setFocusFn        func(p tview.Primitive)
+	setTextTopologyFn func(text string) *tview.TextView
 	// This is used when other components trigger to draw the timeline
 	commandsTimeline *tview.TextView
 }
@@ -44,6 +50,7 @@ type TUIPages struct {
 func NewTUIPages(store *telemetry.Store, setFocusFn func(p tview.Primitive)) *TUIPages {
 	pages := tview.NewPages()
 	tp := &TUIPages{
+		store:      store,
 		pages:      pages,
 		current:    PAGE_TRACES,
 		setFocusFn: setFocusFn,
@@ -51,27 +58,14 @@ func NewTUIPages(store *telemetry.Store, setFocusFn func(p tview.Primitive)) *TU
 
 	tp.registerPages(store)
 
+	initClipboard()
+
 	return tp
 }
 
 // GetPages returns the pages
 func (p *TUIPages) GetPages() *tview.Pages {
 	return p.pages
-}
-
-// ToggleLog toggles the log page.
-func (p *TUIPages) ToggleLog() {
-	cname, cpage := p.pages.GetFrontPage()
-	if cname == PAGE_DEBUG_LOG {
-		// hide log
-		p.pages.SendToBack(PAGE_DEBUG_LOG)
-		p.pages.HidePage(PAGE_DEBUG_LOG)
-	} else {
-		// show log
-		p.pages.ShowPage(PAGE_DEBUG_LOG)
-		p.pages.SendToFront(PAGE_DEBUG_LOG)
-		p.setFocusFn(cpage)
-	}
 }
 
 func (p *TUIPages) showModal(current tview.Primitive, text string) *tview.TextView {
@@ -94,6 +88,9 @@ func (p *TUIPages) TogglePage() {
 		p.switchToPage(PAGE_METRICS)
 	} else if p.current == PAGE_METRICS {
 		p.switchToPage(PAGE_LOGS)
+	} else if p.current == PAGE_LOGS {
+		p.switchToPage(PAGE_TRACE_TOPOLOGY)
+		p.updateTopology(p.store.GetTraceCache())
 	} else {
 		p.switchToPage(PAGE_TRACES)
 	}
@@ -104,14 +101,16 @@ func (p *TUIPages) switchToPage(name string) {
 	p.current = name
 }
 
+func (p *TUIPages) clearPanes() {
+	for _, fn := range p.clearFns {
+		fn()
+	}
+}
+
 func (p *TUIPages) registerPages(store *telemetry.Store) {
 	modal, _ := p.createModalPage("")
 	p.modal = modal
 	p.pages.AddPage(PAGE_MODAL, modal, true, true)
-
-	logpage := p.createDebugLogPage()
-	p.debuglog = logpage
-	p.pages.AddPage(PAGE_DEBUG_LOG, logpage, true, true)
 
 	traces := p.createTracePage(store)
 	p.traces = traces
@@ -120,6 +119,10 @@ func (p *TUIPages) registerPages(store *telemetry.Store) {
 	timeline := p.createTimelinePage()
 	p.timeline = timeline
 	p.pages.AddPage(PAGE_TIMELINE, timeline, true, false)
+
+	topology := p.createTraceTopologyPage(store.GetTraceCache())
+	p.topology = topology
+	p.pages.AddPage(PAGE_TRACE_TOPOLOGY, topology, true, false)
 
 	metrics := p.createMetricsPage(store)
 	p.metrics = metrics
@@ -137,9 +140,12 @@ func (p *TUIPages) createTracePage(store *telemetry.Store) *tview.Flex {
 	tableContainer := tview.NewFlex().SetDirection(tview.FlexRow)
 
 	details := tview.NewFlex().SetDirection(tview.FlexRow)
+	p.clearFns = append(p.clearFns, func() {
+		details.Clear()
+	})
 	details.SetTitle("Details (d)").SetBorder(true)
-	detailspro := DEFAULT_PROPORTION_TRACE_DETAILS
-	tablepro := DEFAULT_PROPORTION_TRACE_TABLE
+	detailspro := DEFAULT_HORIZONTAL_PROPORTION_TRACE_DETAILS
+	tablepro := DEFAULT_HORIZONTAL_PROPORTION_TRACE_TABLE
 
 	details.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -149,10 +155,8 @@ func (p *TUIPages) createTracePage(store *telemetry.Store) *tview.Flex {
 			}
 			tablepro++
 			detailspro--
-			tableFocus := tableContainer.HasFocus()
-			detailsFocus := details.HasFocus()
-			basePage.Clear().AddItem(tableContainer, 0, tablepro, tableFocus).
-				AddItem(details, 0, detailspro, detailsFocus)
+			basePage.ResizeItem(tableContainer, 0, tablepro).
+				ResizeItem(details, 0, detailspro)
 			return nil
 		case tcell.KeyCtrlH:
 			if tablepro <= 1 {
@@ -160,30 +164,44 @@ func (p *TUIPages) createTracePage(store *telemetry.Store) *tview.Flex {
 			}
 			tablepro--
 			detailspro++
-			tableFocus := tableContainer.HasFocus()
-			detailsFocus := details.HasFocus()
-			basePage.Clear().AddItem(tableContainer, 0, tablepro, tableFocus).
-				AddItem(details, 0, detailspro, detailsFocus)
+			basePage.ResizeItem(tableContainer, 0, tablepro).
+				ResizeItem(details, 0, detailspro)
 			return nil
 		}
 		return event
+	})
+	registerCommandList(commands, details, nil, KeyMaps{
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'h', tcell.ModCtrl),
+			description: "Expand details",
+		},
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'l', tcell.ModCtrl),
+			description: "Shrink details",
+		},
 	})
 
 	input := ""
 	inputConfirmed := ""
 	sortType := telemetry.SORT_TYPE_NONE
 	tableContainer.SetTitle("Traces (t)").SetBorder(true)
+	sdft := NewSpanDataForTable(store.GetTraceCache(), store.GetFilteredSvcSpans(), &sortType)
 	table := tview.NewTable().
 		SetBorders(false).
 		SetSelectable(true, false).
-		SetContent(NewSpanDataForTable(store.GetTraceCache(), store.GetFilteredSvcSpans(), &sortType)).
+		SetContent(sdft).
 		SetSelectedFunc(func(row, _ int) {
 			p.showTimelineByRow(store, row-1)
 		}).
 		SetFixed(1, 0)
+	store.SetOnSpanAdded(func() {
+		table.Select(table.GetSelection())
+	})
 	table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlL {
 			store.Flush()
+			p.clearPanes()
+			table.Select(0, 0)
 			return nil
 		} else if event.Key() == tcell.KeyCtrlS {
 			if sortType == telemetry.SORT_TYPE_NONE {
@@ -196,6 +214,17 @@ func (p *TUIPages) createTracePage(store *telemetry.Store) *tview.Flex {
 			log.Printf("sortType: %s", sortType)
 			store.ApplyFilterTraces(inputConfirmed, sortType)
 			return nil
+		} else if event.Key() == tcell.KeyCtrlF {
+			sdft.SetFullDatetime(!sdft.IsFullDatetime())
+			return nil
+		} else if event.Rune() == 'r' {
+			row, _ := table.GetSelection()
+			if row == 0 {
+				return nil
+			}
+			store.RecalculateServiceRootSpanByIdx(row - 1)
+
+			return nil
 		}
 		return event
 	})
@@ -205,11 +234,19 @@ func (p *TUIPages) createTracePage(store *telemetry.Store) *tview.Flex {
 			description: "Search traces",
 		},
 		{
-			key:         tcell.NewEventKey(tcell.KeyRune, 'S', tcell.ModCtrl),
+			key:         tcell.NewEventKey(tcell.KeyRune, 's', tcell.ModCtrl),
 			description: "Toggle sort (Latency)",
 		},
 		{
-			key:         tcell.NewEventKey(tcell.KeyRune, 'L', tcell.ModCtrl),
+			key:         tcell.NewEventKey(tcell.KeyRune, 'f', tcell.ModCtrl),
+			description: "Toggle full datetime",
+		},
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'R', tcell.ModNone),
+			description: "Recalculate service root span",
+		},
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'l', tcell.ModCtrl),
 			description: "Clear all data",
 		},
 	})
@@ -250,8 +287,12 @@ func (p *TUIPages) createTracePage(store *telemetry.Store) *tview.Flex {
 		if row == 0 {
 			return
 		}
+		spans := store.GetFilteredServiceSpansByIdx(row - 1)
+		if spans == nil {
+			return
+		}
 		details.Clear()
-		details.AddItem(getTraceInfoTree(commands, p.showModal, p.hideModal, store.GetFilteredServiceSpansByIdx(row-1)), 0, 1, true)
+		details.AddItem(getTraceInfoTree(commands, p.showModal, p.hideModal, spans), 0, 1, true)
 		log.Printf("selected row(original): %d", row)
 	})
 	tableContainer.
@@ -269,7 +310,7 @@ func (p *TUIPages) createTracePage(store *telemetry.Store) *tview.Flex {
 		return event
 	})
 
-	basePage.AddItem(tableContainer, 0, DEFAULT_PROPORTION_TRACE_TABLE, true).AddItem(details, 0, DEFAULT_PROPORTION_TRACE_DETAILS, false)
+	basePage.AddItem(tableContainer, 0, DEFAULT_HORIZONTAL_PROPORTION_TRACE_TABLE, true).AddItem(details, 0, DEFAULT_HORIZONTAL_PROPORTION_TRACE_DETAILS, false)
 	basePage.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if !search.HasFocus() {
 			switch event.Rune() {
@@ -285,7 +326,7 @@ func (p *TUIPages) createTracePage(store *telemetry.Store) *tview.Flex {
 		return event
 	})
 
-	return attatchTab(attatchCommandList(commands, basePage), PAGE_TRACES)
+	return attachTab(attachCommandList(commands, basePage), PAGE_TRACES)
 }
 
 func (p *TUIPages) createTimelinePage() *tview.Flex {
@@ -303,6 +344,57 @@ func (p *TUIPages) createTimelinePage() *tview.Flex {
 	p.commandsTimeline = newCommandList()
 
 	return page
+}
+
+func (p *TUIPages) createTraceTopologyPage(cache *telemetry.TraceCache) *tview.Flex {
+	commands := newCommandList()
+	page := tview.NewFlex().SetDirection(tview.FlexRow)
+	page.SetBorder(false)
+
+	topo := tview.NewTextView().
+		SetWrap(false).
+		SetRegions(false).
+		SetDynamicColors(false)
+	topo.SetBorder(true).SetTitle("Topology")
+	page.AddItem(topo, 0, 1, true)
+
+	p.setTextTopologyFn = topo.SetText
+
+	topo.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyCtrlR {
+			p.updateTopology(cache)
+			return nil
+		}
+
+		return event
+	})
+	registerCommandList(commands, topo, nil, KeyMaps{
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'R', tcell.ModCtrl),
+			description: "Reload",
+		},
+		{
+			arrow:       true,
+			description: "Scroll view",
+		},
+	})
+
+	return attachTab(attachCommandList(commands, page), PAGE_TRACE_TOPOLOGY)
+}
+
+func (p *TUIPages) updateTopology(cache *telemetry.TraceCache) {
+	p.setTextTopologyFn("Loading...")
+	graph, err := cache.DrawSpanDependencies()
+	if err != nil {
+		p.setTextTopologyFn("Failed to render the trace topology view")
+		log.Printf("Failed to render the trace topology view: %v", err)
+		return
+	}
+	if len(graph) <= 1 {
+		p.setTextTopologyFn("No data")
+		return
+	}
+	p.setTextTopologyFn(graph)
 }
 
 func (p *TUIPages) createModalPage(text string) (*tview.Flex, *tview.TextView) {
@@ -352,7 +444,7 @@ func (p *TUIPages) showTimeline(traceID string, tcache *telemetry.TraceCache, lc
 	)
 	timeline.AddItem(tl, 0, 1, true)
 
-	timeline = attatchCommandList(p.commandsTimeline, timeline)
+	timeline = attachCommandList(p.commandsTimeline, timeline)
 
 	p.timeline.AddItem(timeline, 0, 1, true)
 	p.switchToPage(PAGE_TIMELINE)
@@ -366,9 +458,12 @@ func (p *TUIPages) createMetricsPage(store *telemetry.Store) *tview.Flex {
 
 	side := tview.NewFlex().SetDirection(tview.FlexRow)
 	details := tview.NewFlex().SetDirection(tview.FlexRow)
+	p.clearFns = append(p.clearFns, func() {
+		details.Clear()
+	})
 	details.SetTitle("Details (d)").SetBorder(true)
-	sidepro := DEFAULT_PROPORTION_METRIC_SIDE
-	tablepro := DEFAULT_PROPORTION_METRIC_TABLE
+	sidepro := DEFAULT_HORIZONTAL_PROPORTION_METRIC_SIDE
+	tablepro := DEFAULT_HORIZONTAL_PROPORTION_METRIC_TABLE
 
 	details.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -378,10 +473,8 @@ func (p *TUIPages) createMetricsPage(store *telemetry.Store) *tview.Flex {
 			}
 			tablepro++
 			sidepro--
-			tableFocus := tableContainer.HasFocus()
-			sideFocus := side.HasFocus()
-			basePage.Clear().AddItem(tableContainer, 0, tablepro, tableFocus).
-				AddItem(side, 0, sidepro, sideFocus)
+			basePage.ResizeItem(tableContainer, 0, tablepro).
+				ResizeItem(side, 0, sidepro)
 			return nil
 		case tcell.KeyCtrlH:
 			if tablepro <= 1 {
@@ -389,17 +482,29 @@ func (p *TUIPages) createMetricsPage(store *telemetry.Store) *tview.Flex {
 			}
 			tablepro--
 			sidepro++
-			tableFocus := tableContainer.HasFocus()
-			sideFocus := side.HasFocus()
-			basePage.Clear().AddItem(tableContainer, 0, tablepro, tableFocus).
-				AddItem(side, 0, sidepro, sideFocus)
+			basePage.ResizeItem(tableContainer, 0, tablepro).
+				ResizeItem(side, 0, sidepro)
 			return nil
 		}
 		return event
 	})
+	registerCommandList(commands, details, nil, KeyMaps{
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'h', tcell.ModCtrl),
+			description: "Expand details",
+		},
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'l', tcell.ModCtrl),
+			description: "Shrink details",
+		},
+	})
 
 	chart := tview.NewFlex().SetDirection(tview.FlexRow)
+	p.clearFns = append(p.clearFns, func() {
+		chart.Clear()
+	})
 	chart.SetTitle("Chart (c)").SetBorder(true)
+	registerCommandList(commands, chart, nil, KeyMaps{})
 
 	side.AddItem(details, 0, 5, false).
 		AddItem(chart, 0, 5, false)
@@ -410,9 +515,14 @@ func (p *TUIPages) createMetricsPage(store *telemetry.Store) *tview.Flex {
 		SetSelectable(true, false).
 		SetContent(NewMetricDataForTable(store.GetFilteredMetrics())).
 		SetFixed(1, 0)
+	store.SetOnMetricAdded(func() {
+		table.Select(table.GetSelection())
+	})
 	table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlL {
 			store.Flush()
+			p.clearPanes()
+			table.Select(0, 0)
 			return nil
 		}
 		return event
@@ -423,7 +533,7 @@ func (p *TUIPages) createMetricsPage(store *telemetry.Store) *tview.Flex {
 			description: "Search metrics",
 		},
 		{
-			key:         tcell.NewEventKey(tcell.KeyRune, 'L', tcell.ModCtrl),
+			key:         tcell.NewEventKey(tcell.KeyRune, 'l', tcell.ModCtrl),
 			description: "Clear all data",
 		},
 	})
@@ -466,6 +576,9 @@ func (p *TUIPages) createMetricsPage(store *telemetry.Store) *tview.Flex {
 			return
 		}
 		selected := store.GetFilteredMetricByIdx(row - 1)
+		if selected == nil {
+			return
+		}
 		details.Clear()
 		details.AddItem(getMetricInfoTree(commands, p.showModal, p.hideModal, selected), 0, 1, true)
 		// TODO: async rendering with spinner
@@ -488,7 +601,7 @@ func (p *TUIPages) createMetricsPage(store *telemetry.Store) *tview.Flex {
 		return event
 	})
 
-	basePage.AddItem(tableContainer, 0, DEFAULT_PROPORTION_METRIC_TABLE, true).AddItem(side, 0, DEFAULT_PROPORTION_METRIC_SIDE, false)
+	basePage.AddItem(tableContainer, 0, DEFAULT_HORIZONTAL_PROPORTION_METRIC_TABLE, true).AddItem(side, 0, DEFAULT_HORIZONTAL_PROPORTION_METRIC_SIDE, false)
 	basePage.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if !search.HasFocus() {
 			switch event.Rune() {
@@ -507,7 +620,7 @@ func (p *TUIPages) createMetricsPage(store *telemetry.Store) *tview.Flex {
 		return event
 	})
 
-	return attatchTab(attatchCommandList(commands, basePage), PAGE_METRICS)
+	return attachTab(attachCommandList(commands, basePage), PAGE_METRICS)
 }
 
 func (p *TUIPages) createLogPage(store *telemetry.Store) *tview.Flex {
@@ -518,9 +631,14 @@ func (p *TUIPages) createLogPage(store *telemetry.Store) *tview.Flex {
 	tableContainer := tview.NewFlex().SetDirection(tview.FlexRow)
 
 	details := tview.NewFlex().SetDirection(tview.FlexRow)
+	p.clearFns = append(p.clearFns, func() {
+		details.Clear()
+	})
 	details.SetTitle("Details (d)").SetBorder(true)
-	detailspro := DEFAULT_PROPORTION_LOG_DETAILS
-	tablepro := DEFAULT_PROPORTION_LOG_TABLE
+	detailspro := DEFAULT_HORIZONTAL_PROPORTION_LOG_DETAILS
+	tablepro := DEFAULT_HORIZONTAL_PROPORTION_LOG_TABLE
+	logMainPro := DEFAULT_VERTICAL_PROPORTION_LOG_MAIN
+	logBodyPro := DEFAULT_VERTICAL_PROPORTION_LOG_BODY
 
 	details.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -530,10 +648,8 @@ func (p *TUIPages) createLogPage(store *telemetry.Store) *tview.Flex {
 			}
 			tablepro++
 			detailspro--
-			tableFocus := tableContainer.HasFocus()
-			detailsFocus := details.HasFocus()
-			page.Clear().AddItem(tableContainer, 0, tablepro, tableFocus).
-				AddItem(details, 0, detailspro, detailsFocus)
+			page.ResizeItem(tableContainer, 0, tablepro).
+				ResizeItem(details, 0, detailspro)
 			return nil
 		case tcell.KeyCtrlH:
 			if tablepro <= 1 {
@@ -541,28 +657,81 @@ func (p *TUIPages) createLogPage(store *telemetry.Store) *tview.Flex {
 			}
 			tablepro--
 			detailspro++
-			tableFocus := tableContainer.HasFocus()
-			detailsFocus := details.HasFocus()
-			page.Clear().AddItem(tableContainer, 0, tablepro, tableFocus).
-				AddItem(details, 0, detailspro, detailsFocus)
+			page.ResizeItem(tableContainer, 0, tablepro).
+				ResizeItem(details, 0, detailspro)
 			return nil
 		}
 		return event
 	})
+	registerCommandList(commands, details, nil, KeyMaps{
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'h', tcell.ModCtrl),
+			description: "Expand details",
+		},
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'l', tcell.ModCtrl),
+			description: "Shrink details",
+		},
+	})
 
 	body := tview.NewTextView()
+	p.clearFns = append(p.clearFns, func() {
+		body.Clear()
+	})
 	body.SetBorder(true).SetTitle("Body (b)")
-	registerCommandList(commands, body, nil, KeyMaps{})
+	body.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyCtrlK:
+			if logMainPro <= 1 {
+				return nil
+			}
+			logMainPro--
+			logBodyPro++
+			pageContainer.ResizeItem(page, 0, logMainPro).
+				ResizeItem(body, 0, logBodyPro)
+			return nil
+		case tcell.KeyCtrlJ:
+			if logBodyPro <= 1 {
+				return nil
+			}
+			logMainPro++
+			logBodyPro--
+			pageContainer.ResizeItem(page, 0, logMainPro).
+				ResizeItem(body, 0, logBodyPro)
+			return nil
+		}
+		return event
+	})
+	registerCommandList(commands, body, nil, KeyMaps{
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'j', tcell.ModCtrl),
+			description: "Shrink log body",
+		},
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'k', tcell.ModCtrl),
+			description: "Expand log body",
+		},
+	})
 
 	tableContainer.SetTitle("Logs (o)").SetBorder(true)
+	ldft := NewLogDataForTable(store.GetFilteredLogs())
 	table := tview.NewTable().
 		SetBorders(false).
 		SetSelectable(true, false).
-		SetContent(NewLogDataForTable(store.GetFilteredLogs())).
+		SetContent(ldft).
 		SetFixed(1, 0)
+	store.SetOnLogAdded(func() {
+		table.Select(table.GetSelection())
+	})
 	table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyCtrlL {
+		switch event.Key() {
+		case tcell.KeyCtrlF:
+			ldft.SetFullDatetime(!ldft.IsFullDatetime())
+			return nil
+		case tcell.KeyCtrlL:
 			store.Flush()
+			p.clearPanes()
+			table.Select(0, 0)
 			return nil
 		}
 
@@ -578,7 +747,11 @@ func (p *TUIPages) createLogPage(store *telemetry.Store) *tview.Flex {
 			description: "Copy Log to clipboard",
 		},
 		{
-			key:         tcell.NewEventKey(tcell.KeyRune, 'L', tcell.ModCtrl),
+			key:         tcell.NewEventKey(tcell.KeyRune, 'f', tcell.ModCtrl),
+			description: "Toggle full datetime",
+		},
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'l', tcell.ModCtrl),
 			description: "Clear all data",
 		},
 	})
@@ -622,6 +795,9 @@ func (p *TUIPages) createLogPage(store *telemetry.Store) *tview.Flex {
 			return
 		}
 		selected := store.GetFilteredLogByIdx(row - 1)
+		if selected == nil {
+			return
+		}
 		details.Clear()
 		details.AddItem(getLogInfoTree(commands, p.showModal, p.hideModal, selected, store.GetTraceCache(), func(traceID string) {
 			p.showTimeline(traceID, store.GetTraceCache(), store.GetLogCache(), func(pr tview.Primitive) {
@@ -630,12 +806,8 @@ func (p *TUIPages) createLogPage(store *telemetry.Store) *tview.Flex {
 		}), 0, 1, true)
 		log.Printf("selected row(original): %d", row)
 
-		if selected != nil {
-			resolved = selected.GetResolvedBody()
-			body.SetText(resolved)
-			return
-		}
-		resolved = ""
+		resolved = json.PrettyJSON(selected.GetResolvedBody())
+		body.SetText(resolved)
 	})
 	tableContainer.
 		AddItem(search, 1, 0, false).
@@ -652,7 +824,7 @@ func (p *TUIPages) createLogPage(store *telemetry.Store) *tview.Flex {
 		return event
 	})
 
-	page.AddItem(tableContainer, 0, DEFAULT_PROPORTION_LOG_TABLE, true).AddItem(details, 0, DEFAULT_PROPORTION_LOG_DETAILS, false)
+	page.AddItem(tableContainer, 0, DEFAULT_HORIZONTAL_PROPORTION_LOG_TABLE, true).AddItem(details, 0, DEFAULT_HORIZONTAL_PROPORTION_LOG_DETAILS, false)
 	pageContainer.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if !search.HasFocus() {
 			switch event.Rune() {
@@ -674,34 +846,23 @@ func (p *TUIPages) createLogPage(store *telemetry.Store) *tview.Flex {
 
 		return event
 	})
-	pageContainer.AddItem(page, 0, 1, true).AddItem(body, 5, 1, false)
+	// pageContainer.AddItem(page, 0, 1, true).AddItem(body, 5, 1, false)
+	pageContainer.AddItem(page, 0, DEFAULT_VERTICAL_PROPORTION_LOG_MAIN, true).AddItem(body, 0, DEFAULT_VERTICAL_PROPORTION_LOG_BODY, false)
 
-	return attatchTab(attatchCommandList(commands, pageContainer), PAGE_LOGS)
+	return attachTab(attachCommandList(commands, pageContainer), PAGE_LOGS)
 }
 
-func (p *TUIPages) createDebugLogPage() *tview.Flex {
-	logview := tview.NewTextView().SetDynamicColors(true)
-	logview.Box.SetTitle("Log").SetBorder(true)
-	log.SetOutput(logview)
-
-	initClipboard()
-
-	page := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(nil, 0, 7, false).
-		AddItem(logview, 0, 3, false)
-
-	return page
-}
-
-func attatchTab(p tview.Primitive, name string) *tview.Flex {
+func attachTab(p tview.Primitive, name string) *tview.Flex {
 	var text string
 	switch name {
 	case PAGE_TRACES:
-		text = "< [yellow]Traces[white] | Metrics | Logs > (Tab to switch)"
+		text = "< [yellow]Traces[white] | Metrics | Logs | Topology (beta) > (Tab to switch)"
 	case PAGE_METRICS:
-		text = "< Traces | [yellow]Metrics[white] | Logs > (Tab to switch)"
+		text = "< Traces | [yellow]Metrics[white] | Logs | Topology (beta) > (Tab to switch)"
 	case PAGE_LOGS:
-		text = "< Traces | Metrics | [yellow]Logs[white] > (Tab to switch)"
+		text = "< Traces | Metrics | [yellow]Logs[white] | Topology (beta) > (Tab to switch)"
+	case PAGE_TRACE_TOPOLOGY:
+		text = "< Traces | Metrics | Logs | [yellow]Topology (beta)[white] > (Tab to switch)"
 	}
 
 	tabs := tview.NewTextView().

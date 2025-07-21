@@ -8,6 +8,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"github.com/ymtdzzz/otel-tui/tuiexporter/internal/datetime"
 	"github.com/ymtdzzz/otel-tui/tuiexporter/internal/telemetry"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
@@ -40,6 +41,7 @@ type spanTreeNode struct {
 	label    string
 	box      *tview.Box
 	children []*spanTreeNode
+	expand   bool
 }
 
 func DrawTimeline(commands *tview.TextView, showModalFn showModalFunc, hideModalFn hideModalFunc, traceID string, tcache *telemetry.TraceCache, lcache *telemetry.LogCache, setFocusFn func(p tview.Primitive)) tview.Primitive {
@@ -55,40 +57,15 @@ func DrawTimeline(commands *tview.TextView, showModalFn showModalFunc, hideModal
 	traceContainer := tview.NewFlex().SetDirection(tview.FlexColumn)
 
 	// draw timeline
-	title := tview.NewTextView().SetTextAlign(tview.AlignCenter).SetText("Spans")
 	tree, duration := newSpanTree(traceID, tcache)
-
-	timeline := tview.NewBox().SetBorder(false).
-		SetDrawFunc(func(screen tcell.Screen, x, y, width, height int) (int, int, int, int) {
-			// Draw a horizontal line across the middle of the box.
-			centerY := y + height/2
-			for cx := x + 1; cx < x+width-1; cx++ {
-				screen.SetContent(cx, centerY, tview.BoxDrawingsLightHorizontal, nil, tcell.StyleDefault.Foreground(tcell.ColorWhite))
-			}
-
-			// Write some text along the horizontal line.
-			unit, count := calculateTimelineUnit(duration)
-			for i := 0; i < count; i++ {
-				ratio := float64(i) / float64(count)
-				label := roundDownDuration(unit * time.Duration(i)).String()
-				if i == 0 {
-					label = "0"
-				}
-				tview.Print(screen, label, x+getXByRatio(ratio, width), centerY, width-2, tview.AlignLeft, tcell.ColorYellow)
-			}
-
-			// Space for other content.
-			return x + 1, centerY + 1, width - 2, height - (centerY + 1 - y)
-		})
 
 	// place spans on the timeline
 	snameWidth := SPAN_NAME_COLUMN_WIDTH_DEFAULT
 	grid := tview.NewGrid().
-		SetColumns(snameWidth, 0). // TODO: dynamic width
-		SetBorders(true).
-		AddItem(title, 0, 0, 1, 1, 0, 0, false).
-		AddItem(timeline, 0, 1, 1, 1, 0, 0, false)
+		SetColumns(snameWidth, 0).
+		SetBorders(true)
 	grid.SetTitle("Trace Timeline (t)").SetBorder(true)
+	clearTimeline(duration, grid)
 	registerCommandList(commands, grid, nil, KeyMaps{
 		{
 			key:         tcell.NewEventKey(tcell.KeyUp, ' ', tcell.ModNone),
@@ -128,6 +105,56 @@ func DrawTimeline(commands *tview.TextView, showModalFn showModalFunc, hideModal
 
 	details.SetInputCapture(detailsInputFunc(traceContainer, grid, details, &gridpro, &detailspro))
 
+	// logs
+	logs := tview.NewTable().SetBorders(false).SetSelectable(true, false)
+	var ldft *LogDataForTable
+	logs.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyCtrlF {
+			if ldft != nil {
+				ldft.SetFullDatetime(!ldft.IsFullDatetime())
+			}
+			return nil
+		}
+		return event
+	})
+
+	updateLogTableFn := func(traceID, spanID string, all bool) {
+		logCount := 0
+		if lds, ok := lcache.GetLogsByTraceID(traceID); ok {
+			if !all && spanID != "" {
+				flds := []*telemetry.LogData{}
+				for _, ld := range lds {
+					if ld.Log.SpanID().String() == spanID {
+						flds = append(flds, ld)
+					}
+				}
+				lds = flds
+			}
+			logCount = len(lds)
+			logData := NewLogDataForTableForTimeline(&lds)
+			if ldft != nil {
+				logData.SetFullDatetime(ldft.IsFullDatetime())
+			}
+			ldft = &logData
+			logs.SetContent(&logData)
+			attachModalForTableRows(logs, &logData, showModalFn, hideModalFn)
+		}
+		logs.SetBorder(true).SetTitle(fmt.Sprintf("Logs (l) -- %d logs found (L: toggle collapse, A: toggle filter by span)", logCount))
+	}
+
+	allLogs := false
+	updateLogTableFn(traceID, nodes[0].span.Span.SpanID().String(), allLogs)
+	registerCommandList(commands, logs, nil, KeyMaps{
+		{
+			key:         tcell.NewEventKey(tcell.KeyRune, 'f', tcell.ModCtrl),
+			description: "Toggle full datetime",
+		},
+		{
+			key:         tcell.NewEventKey(tcell.KeyEsc, ' ', tcell.ModNone),
+			description: "Back to Traces",
+		},
+	})
+
 	rows := make([]int, totalRow+2)
 	for i := 0; i < totalRow+1; i++ {
 		rows[i] = 1
@@ -138,8 +165,8 @@ func DrawTimeline(commands *tview.TextView, showModalFn showModalFunc, hideModal
 	log.Printf("totalRow: %d, tviews: %+v", totalRow, tvs)
 
 	// set key handler to grid
+	currentRow := 0
 	if totalRow > 0 {
-		currentRow := 0
 		setFocusFn(tvs[currentRow])
 
 		grid.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -157,6 +184,9 @@ func DrawTimeline(commands *tview.TextView, showModalFn showModalFunc, hideModal
 					details := getSpanInfoTree(commands, showModalFn, hideModalFn, nodes[currentRow].span, TIMELINE_TREE_TITLE)
 					details.SetInputCapture(detailsInputFunc(traceContainer, grid, details, &gridpro, &detailspro))
 					traceContainer.AddItem(details, 0, detailspro, false)
+
+					// update log table
+					updateLogTableFn(traceID, nodes[currentRow].span.Span.SpanID().String(), allLogs)
 				}
 				return nil
 			case tcell.KeyUp:
@@ -171,6 +201,9 @@ func DrawTimeline(commands *tview.TextView, showModalFn showModalFunc, hideModal
 					details := getSpanInfoTree(commands, showModalFn, hideModalFn, nodes[currentRow].span, TIMELINE_TREE_TITLE)
 					details.SetInputCapture(detailsInputFunc(traceContainer, grid, details, &gridpro, &detailspro))
 					traceContainer.AddItem(details, 0, detailspro, false)
+
+					// update log table
+					updateLogTableFn(traceID, nodes[currentRow].span.Span.SpanID().String(), allLogs)
 				}
 				return nil
 			case tcell.KeyCtrlL:
@@ -182,6 +215,23 @@ func DrawTimeline(commands *tview.TextView, showModalFn showModalFunc, hideModal
 				snameWidth = narrowInLimit(SPAN_NAME_COLUMN_WIDTH_RESIZE_UNIT, snameWidth, SPAN_NAME_COLUMN_WIDTH_DEFAULT)
 				grid.SetColumns(snameWidth, 0)
 				return nil
+			case tcell.KeyEnter:
+				nodes[currentRow].expand = !nodes[currentRow].expand
+
+				tvs = []*tview.TextView{}
+				nodes = []*spanTreeNode{}
+				clearTimeline(duration, grid)
+				totalRow = 0
+				for _, n := range tree {
+					totalRow = placeSpan(commands, grid, n, totalRow, 0, &tvs, &nodes)
+				}
+				rows := make([]int, totalRow+2)
+				for i := 0; i < totalRow+1; i++ {
+					rows[i] = 1
+				}
+				grid.SetRows(rows...)
+				setFocusFn(tvs[currentRow])
+				return nil
 			}
 			return event
 		})
@@ -189,22 +239,7 @@ func DrawTimeline(commands *tview.TextView, showModalFn showModalFunc, hideModal
 
 	details.SetBorder(true).SetTitle("Details (d)")
 
-	// logs
-	logs := tview.NewTable().SetBorders(false).SetSelectable(true, false)
-	logCount := 0
-	if lds, ok := lcache.GetLogsByTraceID(traceID); ok {
-		logCount = len(lds)
-		logs.SetContent(NewLogDataForTable(&lds))
-	}
-	logs.SetBorder(true).SetTitle(fmt.Sprintf("Logs (l) -- %d logs found (L to toggle collapse)", logCount))
-	registerCommandList(commands, logs, nil, KeyMaps{
-		{
-			key:         tcell.NewEventKey(tcell.KeyEsc, ' ', tcell.ModNone),
-			description: "Back to Traces",
-		},
-	})
-
-	isCollapse := true
+	isLogCollapse := true
 	traceContainer.AddItem(grid, 0, DEFAULT_PROPORTION_TIMELINE_GRID, true).
 		AddItem(details, 0, DEFAULT_PROPORTION_TIMELINE_DETAILS, false)
 	base.AddItem(traceContainer, 0, 1, true).
@@ -213,26 +248,27 @@ func DrawTimeline(commands *tview.TextView, showModalFn showModalFunc, hideModal
 	base.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Rune() {
 		case 'd':
-			log.Printf("d key pressed")
 			setFocusFn(traceContainer.GetItem(TIMELINE_DETAILS_IDX))
 			return nil
 		case 't':
-			log.Printf("t key pressed")
 			setFocusFn(grid)
 			return nil
 		case 'l':
-			log.Printf("l key pressed")
 			setFocusFn(logs)
 			return nil
 		case 'L':
-			log.Printf("L key pressed")
-			isCollapse = !isCollapse
+			isLogCollapse = !isLogCollapse
 			logHeight := 10
-			if isCollapse {
+			if isLogCollapse {
 				logHeight = 2
 			}
 			base.Clear().AddItem(traceContainer, 0, 1, traceContainer.HasFocus()).
 				AddItem(logs, logHeight, 1, logs.HasFocus())
+
+			return nil
+		case 'A':
+			allLogs = !allLogs
+			updateLogTableFn(traceID, nodes[currentRow].span.Span.SpanID().String(), allLogs)
 
 			return nil
 		}
@@ -240,6 +276,35 @@ func DrawTimeline(commands *tview.TextView, showModalFn showModalFunc, hideModal
 	})
 
 	return base
+}
+
+func clearTimeline(duration time.Duration, grid *tview.Grid) {
+	title := tview.NewTextView().SetTextAlign(tview.AlignCenter).SetText("Spans")
+	timeline := tview.NewBox().SetBorder(false).
+		SetDrawFunc(func(screen tcell.Screen, x, y, width, height int) (int, int, int, int) {
+			// Draw a horizontal line across the middle of the box.
+			centerY := y + height/2
+			for cx := x + 1; cx < x+width-1; cx++ {
+				screen.SetContent(cx, centerY, tview.BoxDrawingsLightHorizontal, nil, tcell.StyleDefault.Foreground(tcell.ColorWhite))
+			}
+
+			// Write some text along the horizontal line.
+			unit, count := calculateTimelineUnit(duration)
+			for i := 0; i < count; i++ {
+				ratio := float64(i) / float64(count)
+				label := roundDownDuration(unit * time.Duration(i)).String()
+				if i == 0 {
+					label = "0"
+				}
+				tview.Print(screen, label, x+getXByRatio(ratio, width), centerY, width-2, tview.AlignLeft, tcell.ColorYellow)
+			}
+
+			// Space for other content.
+			return x + 1, centerY + 1, width - 2, height - (centerY + 1 - y)
+		})
+	grid.Clear().
+		AddItem(title, 0, 0, 1, 1, 0, 0, false).
+		AddItem(timeline, 0, 1, 1, 1, 0, 0, false)
 }
 
 func narrowInLimit(step, curr, limit int) int {
@@ -265,10 +330,8 @@ func detailsInputFunc(traceContainer *tview.Flex, grid *tview.Grid, details *tvi
 			}
 			*gridpro++
 			*detailspro--
-			gridFocus := grid.HasFocus()
-			detailsFocus := details.HasFocus()
-			traceContainer.Clear().AddItem(grid, 0, *gridpro, gridFocus).
-				AddItem(details, 0, *detailspro, detailsFocus)
+			traceContainer.ResizeItem(grid, 0, *gridpro).
+				ResizeItem(details, 0, *detailspro)
 			return nil
 		case tcell.KeyCtrlH:
 			if *gridpro <= 1 {
@@ -276,10 +339,8 @@ func detailsInputFunc(traceContainer *tview.Flex, grid *tview.Grid, details *tvi
 			}
 			*gridpro--
 			*detailspro++
-			gridFocus := grid.HasFocus()
-			detailsFocus := details.HasFocus()
-			traceContainer.Clear().AddItem(grid, 0, *gridpro, gridFocus).
-				AddItem(details, 0, *detailspro, detailsFocus)
+			traceContainer.ResizeItem(grid, 0, *gridpro).
+				ResizeItem(details, 0, *detailspro)
 			return nil
 		}
 		return event
@@ -319,11 +380,22 @@ func placeSpan(commands *tview.TextView, grid *tview.Grid, node *spanTreeNode, r
 		}
 		prefix = prefix + " "
 	}
-	tv := newTextView(commands, prefix+label)
+	exp := " "
+	if len(node.children) > 0 {
+		if node.expand {
+			exp = "▼"
+		} else {
+			exp = "▶"
+		}
+	}
+	tv := newTextView(commands, prefix+exp+label)
 	*tvs = append(*tvs, tv)
 	*nodes = append(*nodes, node)
 	grid.AddItem(tv, row, 0, 1, 1, 0, 0, false)
 	grid.AddItem(node.box, row, 1, 1, 1, 0, 0, false)
+	if !node.expand {
+		return row
+	}
 	sort.SliceStable(node.children, func(i, j int) bool {
 		return node.children[i].span.Span.StartTimestamp().AsTime().Before(
 			node.children[j].span.Span.StartTimestamp().AsTime(),
@@ -349,7 +421,7 @@ func newSpanTree(traceID string, cache *telemetry.TraceCache) (rootNodes []*span
 	colorMemo := make(map[string]tcell.Color)
 	nodes := []*spanTreeNode{}
 	for idx, span := range spans {
-		nodes = append(nodes, &spanTreeNode{span: span})
+		nodes = append(nodes, &spanTreeNode{span: span, expand: true})
 		spanMemo[span.Span.SpanID().String()] = idx
 		if span.Span.StartTimestamp().AsTime().Before(start) {
 			start = span.Span.StartTimestamp().AsTime()
@@ -358,9 +430,9 @@ func newSpanTree(traceID string, cache *telemetry.TraceCache) (rootNodes []*span
 			end = span.Span.EndTimestamp().AsTime()
 		}
 		// color is assigned by the service name
-		sname, _ := span.ResourceSpan.Resource().Attributes().Get("service.name")
-		if _, ok := colorMemo[sname.AsString()]; !ok {
-			colorMemo[sname.AsString()] = colors[len(colorMemo)%len(colors)]
+		sname := telemetry.GetServiceNameFromResource(span.ResourceSpan.Resource())
+		if _, ok := colorMemo[sname]; !ok {
+			colorMemo[sname] = colors[len(colorMemo)%len(colors)]
 		}
 	}
 	duration = end.Sub(start)
@@ -369,10 +441,10 @@ func newSpanTree(traceID string, cache *telemetry.TraceCache) (rootNodes []*span
 	for _, span := range spans {
 		current := span.Span.SpanID().String()
 		node := nodes[spanMemo[current]]
-		sname, _ := span.ResourceSpan.Resource().Attributes().Get("service.name")
+		sname := telemetry.GetServiceNameFromResource(span.ResourceSpan.Resource())
 		st, en := span.Span.StartTimestamp().AsTime().Sub(start), span.Span.EndTimestamp().AsTime().Sub(start)
 		d := en - st
-		node.box = createSpan(colorMemo[sname.AsString()], duration, st, en)
+		node.box = createSpan(colorMemo[sname], duration, st, en)
 		if span.Span.Status().Code() == ptrace.StatusCodeError {
 			node.label = fmt.Sprintf("[!] %s %s", span.Span.Name(), d.String())
 		} else {
@@ -417,6 +489,10 @@ func newTextView(commands *tview.TextView, text string) *tview.TextView {
 		{
 			key:         tcell.NewEventKey(tcell.KeyDown, ' ', tcell.ModNone),
 			description: "Move down",
+		},
+		{
+			key:         tcell.NewEventKey(tcell.KeyEnter, ' ', tcell.ModNone),
+			description: "Toggle folding the child spans",
 		},
 		{
 			key:         tcell.NewEventKey(tcell.KeyRune, 'L', tcell.ModCtrl),
@@ -467,8 +543,8 @@ func createSpan(color tcell.Color, total, start, end time.Duration) (span *tview
 
 func getSpanInfoTree(commands *tview.TextView, showModalFn showModalFunc, hideModalFn hideModalFunc, span *telemetry.SpanData, title string) *tview.TreeView {
 	traceID := span.Span.TraceID().String()
-	sname, _ := span.ResourceSpan.Resource().Attributes().Get("service.name")
-	root := tview.NewTreeNode(fmt.Sprintf("%s (%s)", sname.AsString(), traceID))
+	sname := telemetry.GetServiceNameFromResource(span.ResourceSpan.Resource())
+	root := tview.NewTreeNode(fmt.Sprintf("%s (%s)", sname, traceID))
 	tree := tview.NewTreeView().SetRoot(root).SetCurrentNode(root)
 	tree.SetBorder(true).SetTitle(title)
 
@@ -515,11 +591,11 @@ func getSpanInfoTree(commands *tview.TextView, showModalFn showModalFunc, hideMo
 	durationNode := tview.NewTreeNode(fmt.Sprintf("duration: %s", duration.String()))
 	root.AddChild(durationNode)
 
-	startTime := span.Span.StartTimestamp().AsTime().Format("2006/01/02 15:04:05.000000")
+	startTime := datetime.GetFullTime(span.Span.StartTimestamp().AsTime())
 	startTimeNode := tview.NewTreeNode(fmt.Sprintf("start time: %s", startTime))
 	root.AddChild(startTimeNode)
 
-	endTime := span.Span.EndTimestamp().AsTime().Format("2006/01/02 15:04:05.000000")
+	endTime := datetime.GetFullTime(span.Span.EndTimestamp().AsTime())
 	endTimeNode := tview.NewTreeNode(fmt.Sprintf("end time: %s", endTime))
 	root.AddChild(endTimeNode)
 
@@ -538,7 +614,7 @@ func getSpanInfoTree(commands *tview.TextView, showModalFn showModalFunc, hideMo
 		name := event.Name()
 		eventNode := tview.NewTreeNode(name)
 
-		timestamp := event.Timestamp().AsTime().Format("2006/01/02 15:04:05.000000")
+		timestamp := datetime.GetFullTime(event.Timestamp().AsTime())
 		timestampNode := tview.NewTreeNode(fmt.Sprintf("timestamp: %s", timestamp))
 		eventNode.AddChild(timestampNode)
 
@@ -587,6 +663,39 @@ func getSpanInfoTree(commands *tview.TextView, showModalFn showModalFunc, hideMo
 		links.AddChild(linkNode)
 	}
 	root.AddChild(links)
+
+	// resource info
+	rs := span.ResourceSpan
+	r := rs.Resource()
+	resource := tview.NewTreeNode("Resource")
+	root.AddChild(resource)
+	rdropped := tview.NewTreeNode(fmt.Sprintf("dropped attributes count: %d", r.DroppedAttributesCount()))
+	resource.AddChild(rdropped)
+	rschema := tview.NewTreeNode(fmt.Sprintf("schema url: %s", rs.SchemaUrl()))
+	resource.AddChild(rschema)
+
+	rattrs := tview.NewTreeNode("Attributes")
+	appendAttrsSorted(rattrs, r.Attributes())
+	resource.AddChild(rattrs)
+
+	// scope info
+	scopes := tview.NewTreeNode("Scopes")
+	for si := 0; si < rs.ScopeSpans().Len(); si++ {
+		ss := rs.ScopeSpans().At(si)
+		scope := tview.NewTreeNode(ss.Scope().Name())
+		sschema := tview.NewTreeNode(fmt.Sprintf("schema url: %s", ss.SchemaUrl()))
+		scope.AddChild(sschema)
+
+		scope.AddChild(tview.NewTreeNode(fmt.Sprintf("version: %s", ss.Scope().Version())))
+		scope.AddChild(tview.NewTreeNode(fmt.Sprintf("dropped attributes count: %d", ss.Scope().DroppedAttributesCount())))
+
+		attrs := tview.NewTreeNode("Attributes")
+		appendAttrsSorted(attrs, ss.Scope().Attributes())
+		scope.AddChild(attrs)
+
+		scopes.AddChild(scope)
+	}
+	resource.AddChild(scopes)
 
 	tree.SetSelectedFunc(func(node *tview.TreeNode) {
 		node.SetExpanded(!node.IsExpanded())

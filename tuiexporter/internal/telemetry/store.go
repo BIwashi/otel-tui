@@ -1,10 +1,13 @@
 package telemetry
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/icza/gox/timex"
+	"github.com/ymtdzzz/otel-tui/tuiexporter/internal/datetime"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -30,9 +33,38 @@ func (sd *SpanData) IsRoot() bool {
 	return sd.Span.ParentSpanID().IsEmpty()
 }
 
+func (sd *SpanData) GetServiceName() string {
+	return GetServiceNameFromResource(sd.ResourceSpan.Resource())
+}
+
+func (sd *SpanData) GetDurationText() string {
+	duration := sd.Span.EndTimestamp().AsTime().Sub(sd.Span.StartTimestamp().AsTime())
+	return timex.Round(duration, 2).String()
+}
+
+func (sd *SpanData) GetReceivedAtText(full bool) string {
+	if full {
+		return datetime.GetFullTime(sd.ReceivedAt.Local())
+	}
+	return datetime.GetSimpleTime(sd.ReceivedAt.Local())
+}
+
+func (sd *SpanData) GetSpanName() string {
+	return sd.Span.Name()
+}
+
 // SvcSpans is a slice of service spans
 // This is a slice of one span of a single service
 type SvcSpans []*SpanData
+
+func (ss *SvcSpans) replaceBySpanID(replaceSpanID string, data *SpanData) {
+	for i, s := range *ss {
+		if s.Span.SpanID().String() == replaceSpanID {
+			(*ss)[i] = data
+			return
+		}
+	}
+}
 
 // MetricData is a struct to represent a metric
 type MetricData struct {
@@ -45,6 +77,34 @@ type MetricData struct {
 // HasNumberDatapoints returns whether it has number datapoints
 func (md *MetricData) HasNumberDatapoints() bool {
 	return md.Metric.Type() == pmetric.MetricTypeGauge || md.Metric.Type() == pmetric.MetricTypeSum
+}
+
+func (md *MetricData) GetServiceName() string {
+	return GetServiceNameFromResource(md.ResourceMetric.Resource())
+}
+
+func (md *MetricData) GetMetricName() string {
+	return md.Metric.Name()
+}
+
+func (md *MetricData) GetMetricTypeText() string {
+	return md.Metric.Type().String()
+}
+
+func (md *MetricData) GetDataPointNum() string {
+	switch md.Metric.Type() {
+	case pmetric.MetricTypeGauge:
+		return fmt.Sprintf("%d", md.Metric.Gauge().DataPoints().Len())
+	case pmetric.MetricTypeSum:
+		return fmt.Sprintf("%d", md.Metric.Sum().DataPoints().Len())
+	case pmetric.MetricTypeHistogram:
+		return fmt.Sprintf("%d", md.Metric.Histogram().DataPoints().Len())
+	case pmetric.MetricTypeExponentialHistogram:
+		return fmt.Sprintf("%d", md.Metric.ExponentialHistogram().DataPoints().Len())
+	case pmetric.MetricTypeSummary:
+		return fmt.Sprintf("%d", md.Metric.Summary().DataPoints().Len())
+	}
+	return ""
 }
 
 // LogData is a struct to represent a log
@@ -63,6 +123,37 @@ func (l *LogData) GetResolvedBody() string {
 	})
 
 	return b
+}
+
+func (l *LogData) GetTraceID() string {
+	return l.Log.TraceID().String()
+}
+
+func (l *LogData) GetServiceName() string {
+	return GetServiceNameFromResource(l.ResourceLog.Resource())
+}
+
+func (l *LogData) GetTimestampText(full bool) string {
+	if full {
+		return datetime.GetFullTime(l.Log.Timestamp().AsTime())
+	}
+	return datetime.GetSimpleTime(l.Log.Timestamp().AsTime())
+}
+
+func (l *LogData) GetSeverity() string {
+	return l.Log.SeverityText()
+}
+
+func (l *LogData) GetEventName() string {
+	// see: https://github.com/open-telemetry/semantic-conventions/blob/a4fc971e0c7ffa4b9572654f075d3cb8560db770/docs/general/events.md#event-definition
+	if sname, ok := l.Log.Attributes().Get("event.name"); ok {
+		return sname.AsString()
+	}
+	return ""
+}
+
+func (l *LogData) GetRawData() string {
+	return l.Log.Body().AsString()
 }
 
 // Store is a store of trace spans
@@ -85,6 +176,9 @@ type Store struct {
 	maxServiceSpanCount int
 	maxMetricCount      int
 	maxLogCount         int
+	onSpanAdded         func()
+	onMetricAdded       func()
+	onLogAdded          func()
 }
 
 // NewStore creates a new store
@@ -146,6 +240,21 @@ func (s *Store) UpdatedAt() time.Time {
 	return s.updatedAt
 }
 
+// SetOnSpanAdded sets the callback function to be called when a span is added
+func (s *Store) SetOnSpanAdded(f func()) {
+	s.onSpanAdded = f
+}
+
+// SetOnMetricAdded sets the callback function to be called when a metric is added
+func (s *Store) SetOnMetricAdded(f func()) {
+	s.onMetricAdded = f
+}
+
+// SetOnLogAdded sets the callback function to be called when a log is added
+func (s *Store) SetOnLogAdded(f func()) {
+	s.onLogAdded = f
+}
+
 // ApplyFilterTraces applies a filter and sort to the traces
 func (s *Store) ApplyFilterTraces(svc string, sortType SortType) {
 	s.filterSvc = svc
@@ -159,10 +268,7 @@ func (s *Store) ApplyFilterTraces(svc string, sortType SortType) {
 	}
 
 	for _, span := range s.svcspans {
-		sname := ""
-		if snameattr, ok := span.ResourceSpan.Resource().Attributes().Get("service.name"); ok {
-			sname = snameattr.AsString()
-		}
+		sname := GetServiceNameFromResource(span.ResourceSpan.Resource())
 		target := sname + " " + span.Span.Name()
 		if strings.Contains(target, svc) {
 			s.svcspansFiltered = append(s.svcspansFiltered, span)
@@ -187,10 +293,7 @@ func (s *Store) ApplyFilterMetrics(filter string) {
 	}
 
 	for _, metric := range s.metrics {
-		sname := ""
-		if snameattr, ok := metric.ResourceMetric.Resource().Attributes().Get("service.name"); ok {
-			sname = snameattr.AsString()
-		}
+		sname := GetServiceNameFromResource(metric.ResourceMetric.Resource())
 		target := sname + " " + metric.Metric.Name()
 		if strings.Contains(target, filter) {
 			s.metricsFiltered = append(s.metricsFiltered, metric)
@@ -213,10 +316,7 @@ func (s *Store) ApplyFilterLogs(filter string) {
 	}
 
 	for _, log := range s.logs {
-		sname := ""
-		if snameattr, ok := log.ResourceLog.Resource().Attributes().Get("service.name"); ok {
-			sname = snameattr.AsString()
-		}
+		sname := GetServiceNameFromResource(log.ResourceLog.Resource())
 		target := sname + " " + log.Log.Body().AsString()
 		if strings.Contains(target, filter) {
 			s.logsFiltered = append(s.logsFiltered, log)
@@ -243,10 +343,45 @@ func (s *Store) GetFilteredServiceSpansByIdx(idx int) []*SpanData {
 	}
 	span := s.svcspansFiltered[idx]
 	traceID := span.Span.TraceID().String()
-	sname, _ := span.ResourceSpan.Resource().Attributes().Get("service.name")
-	spans, _ := s.tracecache.GetSpansByTraceIDAndSvc(traceID, sname.AsString())
+	sname := GetServiceNameFromResource(span.ResourceSpan.Resource())
+	spans, _ := s.tracecache.GetSpansByTraceIDAndSvc(traceID, sname)
 
 	return spans
+}
+
+// RecalculateServiceRootSpanByIdx recalculates service root span of the specified index
+func (s *Store) RecalculateServiceRootSpanByIdx(idx int) {
+	s.mut.Lock()
+	defer func() {
+		s.updatedAt = time.Now()
+		s.mut.Unlock()
+	}()
+
+	if idx < 0 || idx >= len(s.svcspansFiltered) {
+		return
+	}
+	traceID := s.svcspansFiltered[idx].Span.TraceID().String()
+	currentSpanID := s.svcspansFiltered[idx].Span.SpanID().String()
+	sname, ok := s.svcspansFiltered[idx].ResourceSpan.Resource().Attributes().Get("service.name")
+	if !ok {
+		return
+	}
+
+	spans := s.tracecache.tracesvc2spans[traceID][sname.AsString()]
+	spanMemo := make(map[string]bool)
+	for _, span := range spans {
+		spanMemo[span.Span.SpanID().String()] = true
+	}
+	for _, span := range spans {
+		parentSpanID := span.Span.ParentSpanID().String()
+		spanID := span.Span.SpanID().String()
+		if _, ok := spanMemo[parentSpanID]; !ok {
+			// TODO: Condider orphan span?
+			sd := s.tracecache.spanid2span[spanID]
+			s.svcspansFiltered[idx] = sd
+			s.svcspans.replaceBySpanID(currentSpanID, sd)
+		}
+	}
 }
 
 // GetFilteredMetricByIdx returns the metric at the given index
@@ -281,19 +416,19 @@ func (s *Store) AddSpan(traces *ptrace.Traces) {
 
 			for si := 0; si < ss.Spans().Len(); si++ {
 				span := ss.Spans().At(si)
-				// attribute service.name is required
-				// see: https://opentelemetry.io/docs/specs/semconv/resource/#service
-				// TODO: set default value when service name is not set
-				sname, _ := rs.Resource().Attributes().Get("service.name")
+				sname := GetServiceNameFromResource(rs.Resource())
 				sd := &SpanData{
 					Span:         &span,
 					ResourceSpan: &rs,
 					ScopeSpans:   &ss,
 					ReceivedAt:   time.Now(),
 				}
-				newtracesvc := s.tracecache.UpdateCache(sname.AsString(), sd)
+				newtracesvc, replaceSpanID := s.tracecache.UpdateCache(sname, sd)
 				if newtracesvc {
 					s.svcspans = append(s.svcspans, sd)
+				} else if len(replaceSpanID) > 0 {
+					// FIXME: More efficient logic is needed
+					s.svcspans.replaceBySpanID(replaceSpanID, sd)
 				}
 			}
 		}
@@ -309,6 +444,10 @@ func (s *Store) AddSpan(traces *ptrace.Traces) {
 	}
 
 	s.updateFilterService()
+
+	if s.onSpanAdded != nil {
+		s.onSpanAdded()
+	}
 }
 
 // AddMetric adds metrics to the store
@@ -326,10 +465,7 @@ func (s *Store) AddMetric(metrics *pmetric.Metrics) {
 			sm := rm.ScopeMetrics().At(smi)
 
 			for si := 0; si < sm.Metrics().Len(); si++ {
-				sname := "N/A"
-				if snameattr, ok := rm.Resource().Attributes().Get("service.name"); ok {
-					sname = snameattr.AsString()
-				}
+				sname := GetServiceNameFromResource(rm.Resource())
 				metric := sm.Metrics().At(si)
 				sd := &MetricData{
 					Metric:         &metric,
@@ -352,6 +488,10 @@ func (s *Store) AddMetric(metrics *pmetric.Metrics) {
 	}
 
 	s.updateFilterMetrics()
+
+	if s.onMetricAdded != nil {
+		s.onMetricAdded()
+	}
 }
 
 // AddLog adds logs to the store
@@ -391,6 +531,10 @@ func (s *Store) AddLog(logs *plog.Logs) {
 	}
 
 	s.updateFilterLogs()
+
+	if s.onLogAdded != nil {
+		s.onLogAdded()
+	}
 }
 
 // Flush clears the store including the cache

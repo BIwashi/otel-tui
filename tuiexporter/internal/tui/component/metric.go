@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -16,21 +17,43 @@ import (
 
 const NULL_VALUE_FLOAT64 = math.MaxFloat64
 
-var metricTableHeader = [4]string{
-	"Service Name",
-	"Metric Name",
-	"Metric Type",
-	"Data Point Count",
+var defaultMetricCellMappers = cellMappers[telemetry.MetricData]{
+	0: {
+		header: "Service Name",
+		getTextRowFn: func(data *telemetry.MetricData) string {
+			return data.GetServiceName()
+		},
+	},
+	1: {
+		header: "Metric Name",
+		getTextRowFn: func(data *telemetry.MetricData) string {
+			return data.GetMetricName()
+		},
+	},
+	2: {
+		header: "Metric Type",
+		getTextRowFn: func(data *telemetry.MetricData) string {
+			return data.GetMetricTypeText()
+		},
+	},
+	3: {
+		header: "Data Point Count",
+		getTextRowFn: func(data *telemetry.MetricData) string {
+			return data.GetDataPointNum()
+		},
+	},
 }
 
 type MetricDataForTable struct {
 	tview.TableContentReadOnly
 	metrics *[]*telemetry.MetricData
+	mapper  cellMappers[telemetry.MetricData]
 }
 
 func NewMetricDataForTable(metrics *[]*telemetry.MetricData) MetricDataForTable {
 	return MetricDataForTable{
 		metrics: metrics,
+		mapper:  defaultMetricCellMappers,
 	}
 }
 
@@ -38,11 +61,10 @@ func NewMetricDataForTable(metrics *[]*telemetry.MetricData) MetricDataForTable 
 // see: https://github.com/rivo/tview/wiki/VirtualTable
 func (m MetricDataForTable) GetCell(row, column int) *tview.TableCell {
 	if row == 0 {
-		sortType := telemetry.SORT_TYPE_NONE
-		return getHeaderCell(metricTableHeader[:], column, &sortType)
+		return m.getHeaderCell(column)
 	}
 	if row > 0 && row <= len(*m.metrics) {
-		return getCellFromMetrics((*m.metrics)[row-1], column)
+		return getCellFromData(m.mapper, (*m.metrics)[row-1], column)
 	}
 	return tview.NewTableCell("N/A")
 }
@@ -52,42 +74,20 @@ func (m MetricDataForTable) GetRowCount() int {
 }
 
 func (m MetricDataForTable) GetColumnCount() int {
-	return len(metricTableHeader)
+	return len(m.mapper)
 }
 
-// getCellFromLog returns a table cell for the given log and column.
-func getCellFromMetrics(metric *telemetry.MetricData, column int) *tview.TableCell {
-	text := "N/A"
-
-	switch column {
-	case 0:
-		if sname, ok := metric.ResourceMetric.Resource().Attributes().Get("service.name"); ok {
-			text = sname.AsString()
-		}
-	case 1:
-		text = metric.Metric.Name()
-	case 2:
-		text = metric.Metric.Type().String()
-	case 3:
-		switch metric.Metric.Type() {
-		case pmetric.MetricTypeGauge:
-			text = fmt.Sprintf("%d", metric.Metric.Gauge().DataPoints().Len())
-		case pmetric.MetricTypeSum:
-			text = fmt.Sprintf("%d", metric.Metric.Sum().DataPoints().Len())
-		case pmetric.MetricTypeHistogram:
-			text = fmt.Sprintf("%d", metric.Metric.Histogram().DataPoints().Len())
-		case pmetric.MetricTypeExponentialHistogram:
-			text = fmt.Sprintf("%d", metric.Metric.ExponentialHistogram().DataPoints().Len())
-		case pmetric.MetricTypeSummary:
-			text = fmt.Sprintf("%d", metric.Metric.Summary().DataPoints().Len())
-		}
+func (m MetricDataForTable) getHeaderCell(column int) *tview.TableCell {
+	cell := tview.NewTableCell("N/A").
+		SetSelectable(false).
+		SetTextColor(tcell.ColorYellow)
+	h, ok := m.mapper[column]
+	if !ok {
+		return cell
 	}
+	cell.SetText(h.header)
 
-	if text == "" {
-		text = "N/A"
-	}
-
-	return tview.NewTableCell(text)
+	return cell
 }
 
 func getMetricInfoTree(commands *tview.TextView, showModalFn showModalFunc, hideModalFn hideModalFunc, m *telemetry.MetricData) *tview.TreeView {
@@ -431,17 +431,28 @@ func drawMetricHistogramChart(commands *tview.TextView, m *telemetry.MetricData)
 		txt := tview.NewFlex().SetDirection(tview.FlexRow)
 		txt.SetBorder(true).SetTitle("Attributes")
 		for bci := 0; bci < dp.BucketCounts().Len(); bci++ {
-			if bci == dp.BucketCounts().Len()-1 {
-				ch.AddBar(fmt.Sprintf("%.1f~", dp.ExplicitBounds().At(bci-1)), uint64ToInt(dp.BucketCounts().At(bci)), tcell.ColorYellow)
+			var label string
+
+			if dp.ExplicitBounds().Len() == 0 {
+				label = "inf"
 			} else {
-				ch.AddBar(fmt.Sprintf("%.1f", dp.ExplicitBounds().At(bci)), uint64ToInt(dp.BucketCounts().At(bci)), tcell.ColorYellow)
+				switch {
+				case bci == 0:
+					label = fmt.Sprintf("~%.1f", dp.ExplicitBounds().At(0))
+				case bci == dp.BucketCounts().Len()-1:
+					label = fmt.Sprintf("%.1f~", dp.ExplicitBounds().At(bci-1))
+				default:
+					label = fmt.Sprintf("%.1f", dp.ExplicitBounds().At(bci))
+				}
 			}
+
+			ch.AddBar(label, uint64ToInt(dp.BucketCounts().At(bci)), tcell.ColorYellow)
 		}
 		sts.AddItem(tview.NewTextView().SetText(fmt.Sprintf("● max: %.1f", dp.Max())), 1, 1, false)
 		sts.AddItem(tview.NewTextView().SetText(fmt.Sprintf("● min: %.1f", dp.Min())), 1, 1, false)
 		sts.AddItem(tview.NewTextView().SetText(fmt.Sprintf("● sum: %.1f", dp.Sum())), 1, 1, false)
 		dp.Attributes().Range(func(k string, v pcommon.Value) bool {
-			txt.AddItem(tview.NewTextView().SetText(fmt.Sprintf("● %s: %s", k, v.Str())), 2, 1, false)
+			txt.AddItem(tview.NewTextView().SetText(fmt.Sprintf("● %s: %s", k, v.AsString())), 2, 1, false)
 			return true
 		})
 		side.AddItem(sts, 5, 1, false).AddItem(txt, 0, 1, false)
@@ -484,10 +495,7 @@ func drawMetricHistogramChart(commands *tview.TextView, m *telemetry.MetricData)
 }
 
 func drawMetricNumberChart(commands *tview.TextView, store *telemetry.Store, m *telemetry.MetricData) tview.Primitive {
-	sname := "N/A"
-	if snameattr, ok := m.ResourceMetric.Resource().Attributes().Get("service.name"); ok {
-		sname = snameattr.AsString()
-	}
+	sname := telemetry.GetServiceNameFromResource(m.ResourceMetric.Resource())
 	mcache := store.GetMetricCache()
 	ms, ok := mcache.GetMetricsBySvcAndMetricName(sname, m.Metric.Name())
 	if !ok {
@@ -646,7 +654,7 @@ func drawMetricNumberChart(commands *tview.TextView, store *telemetry.Store, m *
 	return chart
 }
 
-func getDataToDraw(dataMap map[string]map[string][]*pmetric.NumberDataPoint, attrkey string, start, end time.Time) ([][]float64, *tview.Flex) {
+func getDataToDraw(dataMap map[string]map[string][]*pmetric.NumberDataPoint, attrkey string, start, end time.Time) ([][]float64, *tview.TextView) {
 	// Sort keys
 	keys := make([]string, 0, len(dataMap[attrkey]))
 	for k := range dataMap[attrkey] {
@@ -668,8 +676,8 @@ func getDataToDraw(dataMap map[string]map[string][]*pmetric.NumberDataPoint, att
 			d[i][ii] = NULL_VALUE_FLOAT64
 		}
 	}
-	txts := tview.NewFlex().SetDirection(tview.FlexRow)
-	count := 0
+	tv := tview.NewTextView()
+	tv.SetDynamicColors(true)
 	wholedur := end.Sub(start).Nanoseconds()
 	type locateMap struct {
 		prevpos int
@@ -681,7 +689,8 @@ func getDataToDraw(dataMap map[string]map[string][]*pmetric.NumberDataPoint, att
 	// Set values to timestamp relative position.
 	// Note that this process keeps values between corresponding positions null value.
 	// ex: [1.2 1.3 null 1.6 1.1 null null 2.5]
-	for _, k := range keys {
+	txts := make([]string, len(keys))
+	for i, k := range keys {
 		prevpos := -1
 		prevval := NULL_VALUE_FLOAT64
 		for _, dp := range dataMap[attrkey][k] {
@@ -694,8 +703,8 @@ func getDataToDraw(dataMap map[string]map[string][]*pmetric.NumberDataPoint, att
 				ratio = float64(dur) / float64(wholedur)
 			}
 			pos := int(math.Round(float64(dpnum) * ratio))
-			if pos >= len(d[count]) {
-				pos = len(d[count]) - 1
+			if pos >= len(d[i]) {
+				pos = len(d[i]) - 1
 			}
 			if pos < 0 {
 				pos = 0
@@ -707,8 +716,8 @@ func getDataToDraw(dataMap map[string]map[string][]*pmetric.NumberDataPoint, att
 			case pmetric.NumberDataPointValueTypeInt:
 				val = float64(dp.IntValue())
 			}
-			d[count][pos] = val
-			locatedposmap[count] = append(locatedposmap[count], locateMap{
+			d[i][pos] = val
+			locatedposmap[i] = append(locatedposmap[i], locateMap{
 				prevpos: prevpos,
 				prevval: prevval,
 				pos:     pos,
@@ -717,12 +726,9 @@ func getDataToDraw(dataMap map[string]map[string][]*pmetric.NumberDataPoint, att
 			prevpos = pos
 			prevval = val
 		}
-		txt := tview.NewTextView()
-		txt.SetTextColor(colors[count])
-		txt.SetText(fmt.Sprintf("● %s: %s", attrkey, k))
-		txts.AddItem(txt, 2, 1, false)
-		count++
+		txts[i] = fmt.Sprintf("[%s]● %s: %s", colors[i].String(), attrkey, k)
 	}
+	tv.SetText(strings.Join(txts, "\n"))
 	// Replace null value with appropriate value for smooth line
 	// ex: [1.2 1.3 1.45 1.6 1.1 1.56 2.02 2.5]
 	for i := range d {
@@ -750,7 +756,7 @@ func getDataToDraw(dataMap map[string]map[string][]*pmetric.NumberDataPoint, att
 			}
 		}
 	}
-	return d, txts
+	return d, tv
 }
 
 // uint64ToInt converts uint64 into int. When the input is larger than math.MaxInt, it returns math.MaxInt.

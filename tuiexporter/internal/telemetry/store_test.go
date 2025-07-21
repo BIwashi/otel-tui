@@ -61,18 +61,22 @@ func TestStoreSpanFilters(t *testing.T) {
 	//  | └- scope: test-scope-1-2
 	//  |   └- span: span-1-2-3
 	//  └- resource: test-service-2
-	//    └- scope: test-scope-2-1
-	//      └- span: span-2-1-1
+	//  | └- scope: test-scope-2-1
+	//  |   └- span: span-2-1-1
+	//  └- resource: [Empty]
+	//    └- scope: test-scope-3-1
+	//      └- span: span-3-1-1
 	store := NewStore()
-	payload, testdata := test.GenerateOTLPTracesPayload(t, 1, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
+	payload, testdata := test.GenerateOTLPTracesPayload(t, 1, 3, []int{2, 1, 1}, [][]int{{2, 1}, {1}, {1}})
 	traceID := testdata.Spans[0].TraceID().String()
+	testdata.RSpans[2].Resource().Attributes().Clear()
 	store.AddSpan(&payload)
 
 	store.ApplyFilterTraces("0-0", SORT_TYPE_NONE)
-	assert.Equal(t, 2, len(store.svcspansFiltered))
+	assert.Equal(t, 3, len(store.svcspansFiltered))
 	assert.Equal(t, traceID, store.GetTraceIDByFilteredIdx(0))
 	assert.Equal(t, traceID, store.GetTraceIDByFilteredIdx(1))
-	assert.Equal(t, "", store.GetTraceIDByFilteredIdx(2))
+	assert.Equal(t, "", store.GetTraceIDByFilteredIdx(3))
 	// spans in test-service-1
 	assert.Equal(t, "span-0-0-0", store.GetFilteredServiceSpansByIdx(0)[0].Span.Name())
 	assert.Equal(t, "span-0-0-1", store.GetFilteredServiceSpansByIdx(0)[1].Span.Name())
@@ -91,7 +95,7 @@ func TestStoreSpanFilters(t *testing.T) {
 	}{
 		{
 			name: "invalid index",
-			idx:  1,
+			idx:  2,
 			want: nil,
 		},
 		{
@@ -118,6 +122,10 @@ func TestStoreSpanFilters(t *testing.T) {
 			}
 		})
 	}
+
+	// spans in unknown service
+	store.ApplyFilterTraces("unknown", SORT_TYPE_NONE)
+	assert.Equal(t, "span-2-0-0", store.GetFilteredServiceSpansByIdx(0)[0].Span.Name())
 }
 
 func TestStoreMetricFilters(t *testing.T) {
@@ -135,7 +143,7 @@ func TestStoreMetricFilters(t *testing.T) {
 	//      └- metric: metric-2-1-1
 	//        └- datapoint: dp-2-1-1-1
 	store := NewStore()
-	payload, testdata := test.GenerateOTLPMetricsPayload(t, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
+	payload, testdata := test.GenerateOTLPGaugeMetricsPayload(t, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
 	store.AddMetric(&payload)
 
 	store.ApplyFilterMetrics("service-2")
@@ -362,6 +370,129 @@ func TestStoreAddSpanWithRotation(t *testing.T) {
 	}
 }
 
+func TestStoreAddSpanServiceSpanCalculation(t *testing.T) {
+	// traceid: 1
+	//  └- resource: test-service-1
+	//    └- scope: test-scope-1-1
+	//      └- span: span-1-1-2
+	//      └- span: span-1-1-3
+	// traceid: 1 (the same trace)
+	//  └- resource: test-service-1
+	//    └- scope: test-scope-1-1
+	//      └- span: span-1-1-1
+	store := NewStore()
+	store.maxServiceSpanCount = 1
+	payload1, _ := test.GenerateOTLPTracesPayload(t, 1, 1, []int{3}, [][]int{{3, 0, 0}})
+	payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SetParentSpanID(
+		payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).SpanID(),
+	)
+	payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(2).SetParentSpanID(
+		payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SpanID(),
+	)
+	payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().RemoveIf(func(s ptrace.Span) bool {
+		return s.Name() == "span-0-0-0"
+	})
+	payload2, _ := test.GenerateOTLPTracesPayload(t, 1, 1, []int{3}, [][]int{{3, 0, 0}})
+	payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SetParentSpanID(
+		payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).SpanID(),
+	)
+	payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(2).SetParentSpanID(
+		payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SpanID(),
+	)
+	payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().RemoveIf(func(s ptrace.Span) bool {
+		return s.Name() == "span-0-0-1" || s.Name() == "span-0-0-2"
+	})
+
+	assert.Equal(t, 2, payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().Len())
+	assert.Equal(t, 1, payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().Len())
+
+	store.AddSpan(&payload1)
+
+	// The service root span should be span-1-1-2
+	assert.Equal(t, 1, len(store.svcspans))
+	assert.Equal(t, "span-0-0-1", store.svcspans[0].Span.Name())
+
+	store.AddSpan(&payload2)
+
+	// Now, The service root span should be span-1-1-1
+	assert.Equal(t, 1, len(store.svcspans))
+	assert.Equal(t, "span-0-0-0", store.svcspans[0].Span.Name())
+}
+
+func TestStoreAddSpanServiceSpanCalculationLimitation(t *testing.T) {
+	// traceid: 1
+	//  └- resource: test-service-1
+	//    └- scope: test-scope-1-1
+	//      └- span: span-1-1-3
+	// traceid: 1 (the same trace)
+	//  └- resource: test-service-1
+	//    └- scope: test-scope-1-1
+	//      └- span: span-1-1-1
+	// traceid: 1 (the same trace)
+	//  └- resource: test-service-1
+	//    └- scope: test-scope-1-1
+	//      └- span: span-1-1-2
+	store := NewStore()
+	store.maxServiceSpanCount = 1
+	payload1, _ := test.GenerateOTLPTracesPayload(t, 1, 1, []int{3}, [][]int{{3, 0, 0}})
+	payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SetParentSpanID(
+		payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).SpanID(),
+	)
+	payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(2).SetParentSpanID(
+		payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SpanID(),
+	)
+	payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().RemoveIf(func(s ptrace.Span) bool {
+		return s.Name() == "span-0-0-0" || s.Name() == "span-0-0-1"
+	})
+	payload2, _ := test.GenerateOTLPTracesPayload(t, 1, 1, []int{3}, [][]int{{3, 0, 0}})
+	payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SetParentSpanID(
+		payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).SpanID(),
+	)
+	payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(2).SetParentSpanID(
+		payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SpanID(),
+	)
+	payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().RemoveIf(func(s ptrace.Span) bool {
+		return s.Name() == "span-0-0-1" || s.Name() == "span-0-0-2"
+	})
+	payload3, _ := test.GenerateOTLPTracesPayload(t, 1, 1, []int{3}, [][]int{{3, 0, 0}})
+	payload3.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SetParentSpanID(
+		payload3.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).SpanID(),
+	)
+	payload3.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(2).SetParentSpanID(
+		payload3.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(1).SpanID(),
+	)
+	payload3.ResourceSpans().At(0).ScopeSpans().At(0).Spans().RemoveIf(func(s ptrace.Span) bool {
+		return s.Name() == "span-0-0-0" || s.Name() == "span-0-0-2"
+	})
+
+	assert.Equal(t, 1, payload1.ResourceSpans().At(0).ScopeSpans().At(0).Spans().Len())
+	assert.Equal(t, 1, payload2.ResourceSpans().At(0).ScopeSpans().At(0).Spans().Len())
+	assert.Equal(t, 1, payload3.ResourceSpans().At(0).ScopeSpans().At(0).Spans().Len())
+
+	store.AddSpan(&payload1)
+
+	// The service root span should be span-1-1-3
+	assert.Equal(t, 1, len(store.svcspans))
+	assert.Equal(t, "span-0-0-2", store.svcspans[0].Span.Name())
+
+	store.AddSpan(&payload2)
+
+	// The service root span should still be span-1-1-3
+	assert.Equal(t, 1, len(store.svcspans))
+	assert.Equal(t, "span-0-0-2", store.svcspans[0].Span.Name())
+
+	store.AddSpan(&payload3)
+
+	// Finally, The service root span should be span-1-1-2
+	assert.Equal(t, 1, len(store.svcspans))
+	assert.Equal(t, "span-0-0-1", store.svcspans[0].Span.Name())
+
+	// By RecalculateServiceRootSpanByIdx, we can get span-1-1-1 as the root span
+	store.RecalculateServiceRootSpanByIdx(0)
+	assert.Equal(t, 1, len(store.svcspans))
+	assert.Equal(t, "span-0-0-0", store.svcspans[0].Span.Name())
+}
+
 func TestStoreAddMetricWithoutRotation(t *testing.T) {
 	// metric: 1
 	//  └- resource: test-service-1
@@ -379,7 +510,7 @@ func TestStoreAddMetricWithoutRotation(t *testing.T) {
 	store := NewStore()
 	store.maxMetricCount = 3 // no rotation
 	before := store.updatedAt
-	payload, testdata := test.GenerateOTLPMetricsPayload(t, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
+	payload, testdata := test.GenerateOTLPGaugeMetricsPayload(t, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
 	store.AddMetric(&payload)
 
 	assert.Equal(t, "", store.filterMetric)
@@ -423,7 +554,7 @@ func TestStoreAddMetricWithRotation(t *testing.T) {
 	store := NewStore()
 	store.maxMetricCount = 1 // no rotation
 	before := store.updatedAt
-	payload, testdata := test.GenerateOTLPMetricsPayload(t, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
+	payload, testdata := test.GenerateOTLPGaugeMetricsPayload(t, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
 	store.AddMetric(&payload)
 
 	assert.Equal(t, "", store.filterMetric)
@@ -587,7 +718,7 @@ func TestStoreFlush(t *testing.T) {
 	tp2, _ := test.GenerateOTLPTracesPayload(t, 2, 1, []int{1}, [][]int{{1}})
 	lp1, _ := test.GenerateOTLPLogsPayload(t, 1, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
 	lp2, _ := test.GenerateOTLPLogsPayload(t, 2, 1, []int{1}, [][]int{{1}})
-	m, _ := test.GenerateOTLPMetricsPayload(t, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
+	m, _ := test.GenerateOTLPGaugeMetricsPayload(t, 2, []int{2, 1}, [][]int{{2, 1}, {1}})
 	store.AddSpan(&tp1)
 	store.AddSpan(&tp2)
 	store.AddLog(&lp1)

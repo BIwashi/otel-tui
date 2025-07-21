@@ -5,8 +5,12 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  release:
+  goreleaser:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -25,9 +29,34 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: goreleaser/goreleaser-action@v6
         with:
-          version: '~> v1'
+          version: "~> v1"
           distribution: goreleaser
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+  flake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Update Flake
+        run: ./update-nix.sh
+        continue-on-error: true
+      - name: Check Flake
+        run: "nix-build -E 'with import <nixpkgs> { }; callPackage ./otel-tui.nix { }'"
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          base: main
+          title: "[Automated] Update Nix Flake"
+          add-paths: "otel-tui.nix"
+          commit-message: "[Automated] Update Nix Flake"
+          branch: "automated/update-nix-flake"
+          branch-suffix: timestamp
+          reviewers: "ymtdzzz"
